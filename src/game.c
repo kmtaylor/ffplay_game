@@ -30,11 +30,14 @@ enum state_enum {
     ATTRACT_MODE, GAME_MODE, COUNTDOWN_MODE, WINNER1_MODE, WINNER2_MODE
 };
 
-struct s_control_data {
+#define NUM_CONTROLLERS 2
+struct s_game_data {
     pthread_mutex_t lock;
     pthread_cond_t data_ready;
 
     control_packet *packet_list;
+
+    uint8_t controller[NUM_CONTROLLERS];
 
     int start_game;
 
@@ -44,12 +47,12 @@ struct s_control_data {
     int fd;
 };
 
-static struct s_control_data control_data = {
+static struct s_game_data game_data = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .data_ready = PTHREAD_COND_INITIALIZER,
 
     .packet_list = NULL,
-    .start_game = 1,
+    .start_game = 0,
     .state = ATTRACT_MODE,
 };
 
@@ -99,7 +102,7 @@ void setup_uart(void) {
     t.c_lflag &= ~( ICANON | ECHO | ISIG | IEXTEN | TOSTOP );
     t.c_lflag |= NOFLSH;
     tcsetattr(fd, TCSANOW, &t);
-    control_data.fd = fd;
+    game_data.fd = fd;
 }
 
 void write_uart(uint8_t instruction, uint8_t value) {
@@ -111,7 +114,7 @@ void write_uart(uint8_t instruction, uint8_t value) {
     data[2] = value;
 
     while (nbytes < PACKET_SIZE) {
-	written = write(control_data.fd, &data[nbytes], 1);
+	written = write(game_data.fd, &data[nbytes], 1);
 	if (written < 0) break;
 	nbytes += written;
     }
@@ -122,50 +125,80 @@ void read_uart(void) {
     uint8_t data;
     control_packet *new_packet;
 
-    if (read(control_data.fd, &data, 1) < 1) return;
+    if (read(game_data.fd, &data, 1) < 1) return;
 
     if (data == PACKET_HEADER) byte_no = 0;
     else byte_no++;
 
     if (byte_no == 1) {
-	control_data.cur_instruction = data;
+	game_data.cur_instruction = data;
     } else if (byte_no == 2) {
 	/* Add to linked list */
-	pthread_mutex_lock(&control_data.lock);
+	pthread_mutex_lock(&game_data.lock);
 
-	if (!control_data.packet_list) {
-	    control_data.packet_list = malloc(sizeof(struct s_control_packet));
-	    new_packet = control_data.packet_list;
+	if (!game_data.packet_list) {
+	    game_data.packet_list = malloc(sizeof(struct s_control_packet));
+	    new_packet = game_data.packet_list;
 	} else {
-	    new_packet = control_data.packet_list;
+	    new_packet = game_data.packet_list;
 	    while (new_packet->next) new_packet = new_packet->next;
 	    new_packet->next = malloc(sizeof(struct s_control_packet));
 	    new_packet = new_packet->next;
 	}
-	new_packet->instruction = control_data.cur_instruction;
+	new_packet->instruction = game_data.cur_instruction;
 	new_packet->value = data;
 	new_packet->next = NULL;
 
-	pthread_cond_signal(&control_data.data_ready);
-	pthread_mutex_unlock(&control_data.lock);
+	pthread_cond_signal(&game_data.data_ready);
+	pthread_mutex_unlock(&game_data.lock);
     }
 }
 
-static void *control_func(void *p) {
+static void *uart_func(void *p) {
     fd_set readfds, loopfds;
 
     FD_ZERO(&readfds);
-    FD_SET(control_data.fd, &readfds);
+    FD_SET(game_data.fd, &readfds);
 
     while (1) {
 	loopfds = readfds;
 	select(FD_SETSIZE, &loopfds, NULL, NULL, NULL);
 	
-	if (FD_ISSET(control_data.fd, &loopfds)) {
+	if (FD_ISSET(game_data.fd, &loopfds)) {
 	    read_uart();
 	}
     }
 
+    return NULL;
+}
+
+static void *data_func(void *p) {
+    control_packet *packet;
+    while (1) {
+	pthread_mutex_lock(&game_data.lock);
+	/* Wait until we have some packets to read */
+	while (!game_data.packet_list) {
+	    pthread_cond_wait(&game_data.data_ready, &game_data.lock);
+	}
+	/* Unlink one packet */
+	packet = game_data.packet_list;
+	game_data.packet_list = packet->next;
+
+	switch (packet->instruction >> 4) {
+	    case 0x01: /* Digital input */
+		if (packet->value == 0) {
+		    game_data.start_game = 1;
+		}
+		break;
+	    case 0x02: /* Analogue input */
+		game_data.controller[packet->instruction & 1] = packet->value;
+		break;
+	}
+
+	pthread_mutex_unlock(&game_data.lock);
+
+	free(packet);
+    }
     return NULL;
 }
 
@@ -188,12 +221,31 @@ static int bar_height(SDL_Overlay *overlay, int up) {
     return  (up/100.0) * overlay->h;
 }
 
+static double shape(int i, int width) {
+    if (i > width*7.0/8.0) i = width - i; 
+    if (i < width/8.0) return i / (width/8.0);
+    return 1;
+}
+
 static void draw_horizontal_line(SDL_Overlay *overlay, int origin, int width,
 		uint8_t colour, int layer) {
     int i;
     for (i = 0; i < width; i++) {
-	overlay->pixels[layer][i + origin] = colour;
+	if (layer == 0)
+	    overlay->pixels[layer][i + origin] = colour * shape(i, width);
+	else
+	    overlay->pixels[layer][i + origin] = colour;
     }
+}
+
+static int controller_weight(int controller) {
+    int raw_val;
+
+    pthread_mutex_lock(&game_data.lock);
+    raw_val = game_data.controller[controller & 1];
+    pthread_mutex_unlock(&game_data.lock);
+
+    return 100.0 * (1.0 - exp(-raw_val / 80.0));
 }
 
 #define LEFT_BAR_ORIGIN_ACCROSS	    3
@@ -203,54 +255,54 @@ static void draw_horizontal_line(SDL_Overlay *overlay, int origin, int width,
 #define RIGHT_BAR_ORIGIN_DOWN	    98
 #define RIGHT_BAR_WIDTH		    12
 #define BAR_HEIGHT		    94
-#define BAR_COLOUR_RED		    255
-#define BAR_COLOUR_GREEN	    255
+#define BAR_COLOUR_RED		    128
+#define BAR_COLOUR_GREEN	    0
 #define BAR_COLOUR_BLUE		    0
 void frame_modify_hook(SDL_Overlay *overlay) {
     int i;
     int origin, pixel_height, pixel_width;
-    static int height;
 
-    if (control_data.state != GAME_MODE) return;
+    if (game_data.state != GAME_MODE) return;
 
     SDL_LockYUVOverlay (overlay);
 
-    pixel_height = bar_height(overlay, height);
-    height += 10;
-    if (height >= BAR_HEIGHT) height = 0;
-
     /* Left player bar */
+    pixel_height = bar_height(overlay, controller_weight(0));
     for (i = 0; i < pixel_height; i++) {
 	origin = bar_origin(overlay, LEFT_BAR_ORIGIN_ACCROSS,
 			    LEFT_BAR_ORIGIN_DOWN, 1);
 	origin -= i * overlay->w;
 	pixel_width = bar_width(overlay, LEFT_BAR_WIDTH);
+	pixel_width *= (1.0) * i / bar_height(overlay, BAR_HEIGHT);
 	draw_horizontal_line(overlay, origin, pixel_width,
-			RGB_TO_Y_CCIR(BAR_COLOUR_RED, BAR_COLOUR_GREEN,
-				BAR_COLOUR_BLUE), 0);
+			RGB_TO_Y(BAR_COLOUR_BLUE, BAR_COLOUR_GREEN,
+				BAR_COLOUR_RED), 0);
     }
     for (i = 0; i < pixel_height / 2; i++) {
 	origin = bar_origin(overlay, LEFT_BAR_ORIGIN_ACCROSS,
 			    LEFT_BAR_ORIGIN_DOWN, 2);
 	origin -= i * overlay->w / 2;
 	pixel_width = bar_width(overlay, LEFT_BAR_WIDTH) / 2;
+	pixel_width *= (2.0) * i / bar_height(overlay, BAR_HEIGHT);
+	pixel_width += 1;
 	draw_horizontal_line(overlay, origin, pixel_width,
-			RGB_TO_U_CCIR(BAR_COLOUR_RED, BAR_COLOUR_GREEN,
-				BAR_COLOUR_BLUE, 0), 1);
+			RGB_TO_U(BAR_COLOUR_BLUE, BAR_COLOUR_GREEN,
+				BAR_COLOUR_RED, 0), 1);
 	draw_horizontal_line(overlay, origin, pixel_width,
-			RGB_TO_V_CCIR(BAR_COLOUR_RED, BAR_COLOUR_GREEN,
-				BAR_COLOUR_BLUE, 0), 2);
+			RGB_TO_V(BAR_COLOUR_BLUE, BAR_COLOUR_GREEN,
+				BAR_COLOUR_RED, 0), 2);
     }
 
     /* Right player bar */
+    pixel_height = bar_height(overlay, controller_weight(1));
     for (i = 0; i < pixel_height; i++) {
 	origin = bar_origin(overlay, RIGHT_BAR_ORIGIN_ACCROSS,
 			    RIGHT_BAR_ORIGIN_DOWN, 1);
 	origin -= i * overlay->w;
 	pixel_width = bar_width(overlay, RIGHT_BAR_WIDTH);
 	draw_horizontal_line(overlay, origin, pixel_width,
-			RGB_TO_Y_CCIR(BAR_COLOUR_RED, BAR_COLOUR_GREEN,
-				BAR_COLOUR_BLUE), 0);
+			RGB_TO_Y_CCIR(BAR_COLOUR_BLUE, BAR_COLOUR_GREEN,
+				BAR_COLOUR_RED), 0);
     }
     for (i = 0; i < pixel_height / 2; i++) {
 	origin = bar_origin(overlay, RIGHT_BAR_ORIGIN_ACCROSS,
@@ -258,18 +310,18 @@ void frame_modify_hook(SDL_Overlay *overlay) {
 	origin -= i * overlay->w / 2;
 	pixel_width = bar_width(overlay, RIGHT_BAR_WIDTH) / 2;
 	draw_horizontal_line(overlay, origin, pixel_width,
-			RGB_TO_U_CCIR(BAR_COLOUR_RED, BAR_COLOUR_GREEN,
-				BAR_COLOUR_BLUE, 0), 1);
+			RGB_TO_U_CCIR(BAR_COLOUR_BLUE, BAR_COLOUR_GREEN,
+				BAR_COLOUR_RED, 0), 1);
 	draw_horizontal_line(overlay, origin, pixel_width,
-			RGB_TO_V_CCIR(BAR_COLOUR_RED, BAR_COLOUR_GREEN,
-				BAR_COLOUR_BLUE, 0), 2);
+			RGB_TO_V_CCIR(BAR_COLOUR_BLUE, BAR_COLOUR_GREEN,
+				BAR_COLOUR_RED, 0), 2);
     }
 
     SDL_UnlockYUVOverlay (overlay);
 }
 
 static void sleep_mode(void) {
-    switch (control_data.state) {
+    switch (game_data.state) {
 	case ATTRACT_MODE:
 	    sleep(17);
 	    break;
@@ -289,18 +341,28 @@ static void sleep_mode(void) {
 }
 
 static int choose_winner(void) {
-    return 0;
+    int retval;
+    
+    pthread_mutex_lock(&game_data.lock);
+    
+    if (game_data.controller[0] > game_data.controller[1]) retval = 0;
+    else retval = 1;
+
+    pthread_mutex_unlock(&game_data.lock);
+    
+    return retval;
 }
 
 static enum state_enum get_game_state(enum state_enum old_state) {
     switch (old_state) {
 	case ATTRACT_MODE:
-	    pthread_mutex_lock(&control_data.lock);
-	    if (control_data.start_game) {
-		pthread_mutex_unlock(&control_data.lock);
+	    pthread_mutex_lock(&game_data.lock);
+	    if (game_data.start_game) {
+		game_data.start_game = 0;
+		pthread_mutex_unlock(&game_data.lock);
 		return COUNTDOWN_MODE;
 	    } else {
-		pthread_mutex_unlock(&control_data.lock);
+		pthread_mutex_unlock(&game_data.lock);
 		return ATTRACT_MODE;
 	    }
 	case COUNTDOWN_MODE:
@@ -321,8 +383,8 @@ static void *game_func(void *is_p) {
     sleep_mode();
 
     while (1) {
-	control_data.state = get_game_state(control_data.state);
-	switch (control_data.state) {
+	game_data.state = get_game_state(game_data.state);
+	switch (game_data.state) {
 	    case ATTRACT_MODE:
 		attract_mode(is);
 		sleep_mode();
@@ -356,20 +418,20 @@ static void *game_func(void *is_p) {
 
 int main(void) {
     pthread_t game_thread;
-    pthread_t control_thread;
+    pthread_t uart_thread;
+    pthread_t data_thread;
     VideoState *is;
 
     wanted_stream[AVMEDIA_TYPE_AUDIO] = ATTRACT_AUDIO_STREAM;
     wanted_stream[AVMEDIA_TYPE_VIDEO] = ATTRACT_VIDEO_STREAM;
-//    wanted_stream[AVMEDIA_TYPE_AUDIO] = GAME_AUDIO_STREAM;
-//    wanted_stream[AVMEDIA_TYPE_VIDEO] = GAME_VIDEO_STREAM;
 
-    //setup_uart();
+    setup_uart();
 
     is = ffplay_init("../resource/media.mp4");
 
     pthread_create(&game_thread, NULL, game_func, is);
-    pthread_create(&control_thread, NULL, control_func, NULL);
+    pthread_create(&uart_thread, NULL, uart_func, NULL);
+    pthread_create(&data_thread, NULL, data_func, NULL);
 
     ffplay_event_loop(is);
 
