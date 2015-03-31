@@ -9,6 +9,7 @@
 #include <libavcodec/avfft.h>
 
 #include "ffplay.h"
+#include "colorspace.h"
 
 #define PACKET_HEADER 0xff
 #define PACKET_SIZE 3
@@ -25,6 +26,10 @@ struct s_control_packet {
     control_packet *next;
 };
 
+enum state_enum {
+    ATTRACT_MODE, GAME_MODE, COUNTDOWN_MODE, WINNER1_MODE, WINNER2_MODE
+};
+
 struct s_control_data {
     pthread_mutex_t lock;
     pthread_cond_t data_ready;
@@ -32,6 +37,8 @@ struct s_control_data {
     control_packet *packet_list;
 
     int start_game;
+
+    enum state_enum state;
 
     uint8_t cur_instruction;
     int fd;
@@ -43,6 +50,7 @@ static struct s_control_data control_data = {
 
     .packet_list = NULL,
     .start_game = 1,
+    .state = ATTRACT_MODE,
 };
 
 #define ATTRACT_VIDEO_STREAM	0
@@ -161,12 +169,107 @@ static void *control_func(void *p) {
     return NULL;
 }
 
-enum state_enum {
-    ATTRACT_MODE, GAME_MODE, COUNTDOWN_MODE, WINNER1_MODE, WINNER2_MODE
-};
+/* Return index of lower left pixel of bar graph, from percentage screen size */
+static int bar_origin(SDL_Overlay *overlay, int accross, int down, int div) {
+    int line_no, pixel_address;
+    line_no = (down/100.0) * overlay->h / div;
+    pixel_address = line_no * overlay->w / div;
+    pixel_address += (accross/100.0) * overlay->w / div;
+    return pixel_address;
+}
 
-static void sleep_mode(enum state_enum state) {
-    switch (state) {
+/* Return bar width in pixels from percentage of screen size */
+static int bar_width(SDL_Overlay *overlay, int accross) {
+    return (accross/100.0) * overlay->w;
+}
+
+/* Return bar height in lines from percentage of screen size */
+static int bar_height(SDL_Overlay *overlay, int up) {
+    return  (up/100.0) * overlay->h;
+}
+
+static void draw_horizontal_line(SDL_Overlay *overlay, int origin, int width,
+		uint8_t colour, int layer) {
+    int i;
+    for (i = 0; i < width; i++) {
+	overlay->pixels[layer][i + origin] = colour;
+    }
+}
+
+#define LEFT_BAR_ORIGIN_ACCROSS	    3
+#define LEFT_BAR_ORIGIN_DOWN	    98
+#define LEFT_BAR_WIDTH		    12
+#define RIGHT_BAR_ORIGIN_ACCROSS    85
+#define RIGHT_BAR_ORIGIN_DOWN	    98
+#define RIGHT_BAR_WIDTH		    12
+#define BAR_HEIGHT		    94
+#define BAR_COLOUR_RED		    255
+#define BAR_COLOUR_GREEN	    255
+#define BAR_COLOUR_BLUE		    0
+void frame_modify_hook(SDL_Overlay *overlay) {
+    int i;
+    int origin, pixel_height, pixel_width;
+    static int height;
+
+    if (control_data.state != GAME_MODE) return;
+
+    SDL_LockYUVOverlay (overlay);
+
+    pixel_height = bar_height(overlay, height);
+    height += 10;
+    if (height >= BAR_HEIGHT) height = 0;
+
+    /* Left player bar */
+    for (i = 0; i < pixel_height; i++) {
+	origin = bar_origin(overlay, LEFT_BAR_ORIGIN_ACCROSS,
+			    LEFT_BAR_ORIGIN_DOWN, 1);
+	origin -= i * overlay->w;
+	pixel_width = bar_width(overlay, LEFT_BAR_WIDTH);
+	draw_horizontal_line(overlay, origin, pixel_width,
+			RGB_TO_Y_CCIR(BAR_COLOUR_RED, BAR_COLOUR_GREEN,
+				BAR_COLOUR_BLUE), 0);
+    }
+    for (i = 0; i < pixel_height / 2; i++) {
+	origin = bar_origin(overlay, LEFT_BAR_ORIGIN_ACCROSS,
+			    LEFT_BAR_ORIGIN_DOWN, 2);
+	origin -= i * overlay->w / 2;
+	pixel_width = bar_width(overlay, LEFT_BAR_WIDTH) / 2;
+	draw_horizontal_line(overlay, origin, pixel_width,
+			RGB_TO_U_CCIR(BAR_COLOUR_RED, BAR_COLOUR_GREEN,
+				BAR_COLOUR_BLUE, 0), 1);
+	draw_horizontal_line(overlay, origin, pixel_width,
+			RGB_TO_V_CCIR(BAR_COLOUR_RED, BAR_COLOUR_GREEN,
+				BAR_COLOUR_BLUE, 0), 2);
+    }
+
+    /* Right player bar */
+    for (i = 0; i < pixel_height; i++) {
+	origin = bar_origin(overlay, RIGHT_BAR_ORIGIN_ACCROSS,
+			    RIGHT_BAR_ORIGIN_DOWN, 1);
+	origin -= i * overlay->w;
+	pixel_width = bar_width(overlay, RIGHT_BAR_WIDTH);
+	draw_horizontal_line(overlay, origin, pixel_width,
+			RGB_TO_Y_CCIR(BAR_COLOUR_RED, BAR_COLOUR_GREEN,
+				BAR_COLOUR_BLUE), 0);
+    }
+    for (i = 0; i < pixel_height / 2; i++) {
+	origin = bar_origin(overlay, RIGHT_BAR_ORIGIN_ACCROSS,
+			    RIGHT_BAR_ORIGIN_DOWN, 2);
+	origin -= i * overlay->w / 2;
+	pixel_width = bar_width(overlay, RIGHT_BAR_WIDTH) / 2;
+	draw_horizontal_line(overlay, origin, pixel_width,
+			RGB_TO_U_CCIR(BAR_COLOUR_RED, BAR_COLOUR_GREEN,
+				BAR_COLOUR_BLUE, 0), 1);
+	draw_horizontal_line(overlay, origin, pixel_width,
+			RGB_TO_V_CCIR(BAR_COLOUR_RED, BAR_COLOUR_GREEN,
+				BAR_COLOUR_BLUE, 0), 2);
+    }
+
+    SDL_UnlockYUVOverlay (overlay);
+}
+
+static void sleep_mode(void) {
+    switch (control_data.state) {
 	case ATTRACT_MODE:
 	    sleep(17);
 	    break;
@@ -214,37 +317,36 @@ static enum state_enum get_game_state(enum state_enum old_state) {
 
 static void *game_func(void *is_p) {
     VideoState *is = (VideoState *) is_p;
-    static enum state_enum state = ATTRACT_MODE;
 
-    sleep_mode(state);
+    sleep_mode();
 
     while (1) {
-	state = get_game_state(state);
-	switch (state) {
+	control_data.state = get_game_state(control_data.state);
+	switch (control_data.state) {
 	    case ATTRACT_MODE:
 		attract_mode(is);
-		sleep_mode(state);
+		sleep_mode();
 		break;
 
 	    case COUNTDOWN_MODE:
 		countdown_mode(is);
-		sleep_mode(state);
+		sleep_mode();
 		break;
 
 	    case GAME_MODE:
 		game_mode(is);
-		/* draw bar graphs (in a new thread) */
-		sleep_mode(state);
+		/* draw bar graphs (in a separate thread) */
+		sleep_mode();
 		break;
 
 	    case WINNER1_MODE:
 		winner1_mode(is);
-		sleep_mode(state);
+		sleep_mode();
 		break;
 
 	    case WINNER2_MODE:
 		winner2_mode(is);
-		sleep_mode(state);
+		sleep_mode();
 		break;
 	}
     }
@@ -259,11 +361,13 @@ int main(void) {
 
     wanted_stream[AVMEDIA_TYPE_AUDIO] = ATTRACT_AUDIO_STREAM;
     wanted_stream[AVMEDIA_TYPE_VIDEO] = ATTRACT_VIDEO_STREAM;
+//    wanted_stream[AVMEDIA_TYPE_AUDIO] = GAME_AUDIO_STREAM;
+//    wanted_stream[AVMEDIA_TYPE_VIDEO] = GAME_VIDEO_STREAM;
 
     //setup_uart();
 
     is = ffplay_init("../resource/media.mp4");
-    
+
     pthread_create(&game_thread, NULL, game_func, is);
     pthread_create(&control_thread, NULL, control_func, NULL);
 

@@ -110,7 +110,7 @@ int wanted_stream[AVMEDIA_TYPE_NB] = {
 };
 static int seek_by_bytes = -1;
 int display_disable;
-static int show_status = 1;
+static int show_status = 0;
 static int av_sync_type = AV_SYNC_AUDIO_MASTER;
 static int64_t start_time = AV_NOPTS_VALUE;
 static int64_t duration = AV_NOPTS_VALUE;
@@ -147,7 +147,7 @@ AVPacket flush_pkt;
 #define FF_ALLOC_EVENT   (SDL_USEREVENT)
 #define FF_QUIT_EVENT    (SDL_USEREVENT + 2)
 
-static SDL_Surface *screen;
+SDL_Surface *screen;
 
 static int packet_queue_put(PacketQueue *q, AVPacket *pkt);
 
@@ -599,6 +599,10 @@ static void calculate_display_rect(SDL_Rect *rect, int scr_xleft, int scr_ytop, 
     rect->h = FFMAX(height, 1);
 }
 
+static void _frame_modify_hook(SDL_Overlay *overlay) {}
+__typeof(_frame_modify_hook) frame_modify_hook 
+    __attribute__ ((weak, alias ("_frame_modify_hook")));
+
 static void video_image_display(VideoState *is)
 {
     VideoPicture *vp;
@@ -632,9 +636,9 @@ static void video_image_display(VideoState *is)
                 }
             }
         }
+	frame_modify_hook(vp->bmp);
 
         calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height, vp);
-
         SDL_DisplayYUVOverlay(vp->bmp, &rect);
 
         if (rect.x != is->last_display_rect.x || rect.y != is->last_display_rect.y || rect.w != is->last_display_rect.w || rect.h != is->last_display_rect.h || is->force_refresh) {

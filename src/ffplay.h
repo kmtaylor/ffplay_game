@@ -156,6 +156,7 @@ typedef struct VideoState {
 } VideoState;
 
 extern const char *input_filename;
+extern SDL_Surface *screen;
 extern int display_disable;
 extern int audio_disable;
 extern int video_disable;
@@ -179,3 +180,5 @@ extern void stream_seek(VideoState *is, int64_t pos, int64_t rel,
 		int seek_by_bytes);
 extern int video_open(VideoState *is, int force_set_video_mode, 
 		VideoPicture *vp);
+
+extern void frame_modify_hook(SDL_Overlay *overlay);
