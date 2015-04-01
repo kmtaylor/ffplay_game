@@ -1,4 +1,3 @@
-#include <pthread.h>
 #include <termios.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -32,8 +31,9 @@ enum state_enum {
 
 #define NUM_CONTROLLERS 2
 struct s_game_data {
-    pthread_mutex_t lock;
-    pthread_cond_t data_ready;
+    SDL_mutex *lock;
+    SDL_cond *data_ready;
+    SDL_cond *state_changed;
 
     control_packet *packet_list;
 
@@ -48,9 +48,6 @@ struct s_game_data {
 };
 
 static struct s_game_data game_data = {
-    .lock = PTHREAD_MUTEX_INITIALIZER,
-    .data_ready = PTHREAD_COND_INITIALIZER,
-
     .packet_list = NULL,
     .start_game = 0,
     .state = ATTRACT_MODE,
@@ -134,7 +131,7 @@ void read_uart(void) {
 	game_data.cur_instruction = data;
     } else if (byte_no == 2) {
 	/* Add to linked list */
-	pthread_mutex_lock(&game_data.lock);
+	SDL_LockMutex(game_data.lock);
 
 	if (!game_data.packet_list) {
 	    game_data.packet_list = malloc(sizeof(struct s_control_packet));
@@ -149,12 +146,12 @@ void read_uart(void) {
 	new_packet->value = data;
 	new_packet->next = NULL;
 
-	pthread_cond_signal(&game_data.data_ready);
-	pthread_mutex_unlock(&game_data.lock);
+	SDL_CondSignal(game_data.data_ready);
+	SDL_UnlockMutex(game_data.lock);
     }
 }
 
-static void *uart_func(void *p) {
+static int uart_func(void *p) {
     fd_set readfds, loopfds;
 
     FD_ZERO(&readfds);
@@ -169,16 +166,16 @@ static void *uart_func(void *p) {
 	}
     }
 
-    return NULL;
+    return 0;
 }
 
-static void *data_func(void *p) {
+static int data_func(void *p) {
     control_packet *packet;
     while (1) {
-	pthread_mutex_lock(&game_data.lock);
+	SDL_LockMutex(game_data.lock);
 	/* Wait until we have some packets to read */
 	while (!game_data.packet_list) {
-	    pthread_cond_wait(&game_data.data_ready, &game_data.lock);
+	    SDL_CondWait(game_data.data_ready, game_data.lock);
 	}
 	/* Unlink one packet */
 	packet = game_data.packet_list;
@@ -188,6 +185,7 @@ static void *data_func(void *p) {
 	    case 0x01: /* Digital input */
 		if (packet->value == 0) {
 		    game_data.start_game = 1;
+		    SDL_CondSignal(game_data.state_changed);
 		}
 		break;
 	    case 0x02: /* Analogue input */
@@ -195,11 +193,11 @@ static void *data_func(void *p) {
 		break;
 	}
 
-	pthread_mutex_unlock(&game_data.lock);
+	SDL_UnlockMutex(game_data.lock);
 
 	free(packet);
     }
-    return NULL;
+    return 0;
 }
 
 /* Return index of lower left pixel of bar graph, from percentage screen size */
@@ -241,9 +239,9 @@ static void draw_horizontal_line(SDL_Overlay *overlay, int origin, int width,
 static int controller_weight(int controller) {
     int raw_val;
 
-    pthread_mutex_lock(&game_data.lock);
+    SDL_LockMutex(game_data.lock);
     raw_val = game_data.controller[controller & 1];
-    pthread_mutex_unlock(&game_data.lock);
+    SDL_UnlockMutex(game_data.lock);
 
     return 100.0 * (1.0 - exp(-raw_val / 80.0));
 }
@@ -321,9 +319,14 @@ void frame_modify_hook(SDL_Overlay *overlay) {
 }
 
 static void sleep_mode(void) {
+    int timeout = 0;
     switch (game_data.state) {
 	case ATTRACT_MODE:
-	    sleep(17);
+	    SDL_LockMutex(game_data.lock);
+	    while (game_data.state == ATTRACT_MODE && !timeout)
+		timeout = SDL_CondWaitTimeout(game_data.state_changed,
+				game_data.lock, 18 * 1000);
+	    SDL_UnlockMutex(game_data.lock);
 	    break;
 	case COUNTDOWN_MODE:
 	    sleep(8);
@@ -343,12 +346,12 @@ static void sleep_mode(void) {
 static int choose_winner(void) {
     int retval;
     
-    pthread_mutex_lock(&game_data.lock);
+    SDL_LockMutex(game_data.lock);
     
     if (game_data.controller[0] > game_data.controller[1]) retval = 0;
     else retval = 1;
 
-    pthread_mutex_unlock(&game_data.lock);
+    SDL_UnlockMutex(game_data.lock);
     
     return retval;
 }
@@ -356,13 +359,13 @@ static int choose_winner(void) {
 static enum state_enum get_game_state(enum state_enum old_state) {
     switch (old_state) {
 	case ATTRACT_MODE:
-	    pthread_mutex_lock(&game_data.lock);
+	    SDL_LockMutex(game_data.lock);
 	    if (game_data.start_game) {
 		game_data.start_game = 0;
-		pthread_mutex_unlock(&game_data.lock);
+		SDL_UnlockMutex(game_data.lock);
 		return COUNTDOWN_MODE;
 	    } else {
-		pthread_mutex_unlock(&game_data.lock);
+		SDL_UnlockMutex(game_data.lock);
 		return ATTRACT_MODE;
 	    }
 	case COUNTDOWN_MODE:
@@ -377,7 +380,7 @@ static enum state_enum get_game_state(enum state_enum old_state) {
     return ATTRACT_MODE;
 }
 
-static void *game_func(void *is_p) {
+static int stream_func(void *is_p) {
     VideoState *is = (VideoState *) is_p;
 
     sleep_mode();
@@ -413,13 +416,10 @@ static void *game_func(void *is_p) {
 	}
     }
 
-    return NULL;
+    return 0;
 }
 
 int main(void) {
-    pthread_t game_thread;
-    pthread_t uart_thread;
-    pthread_t data_thread;
     VideoState *is;
 
     wanted_stream[AVMEDIA_TYPE_AUDIO] = ATTRACT_AUDIO_STREAM;
@@ -429,9 +429,13 @@ int main(void) {
 
     is = ffplay_init("../resource/media.mp4");
 
-    pthread_create(&game_thread, NULL, game_func, is);
-    pthread_create(&uart_thread, NULL, uart_func, NULL);
-    pthread_create(&data_thread, NULL, data_func, NULL);
+    game_data.lock = SDL_CreateMutex();
+    game_data.data_ready = SDL_CreateCond();
+    game_data.state_changed = SDL_CreateCond();
+
+    SDL_CreateThread(stream_func, is);
+    SDL_CreateThread(uart_func, NULL);
+    SDL_CreateThread(data_func, NULL);
 
     ffplay_event_loop(is);
 
