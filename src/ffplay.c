@@ -139,7 +139,7 @@ static int64_t cursor_last_shown;
 static int cursor_hidden = 0;
 
 /* current context */
-static int is_full_screen;
+static int is_full_screen = 1;
 static int64_t audio_callback_time;
 
 AVPacket flush_pkt;
