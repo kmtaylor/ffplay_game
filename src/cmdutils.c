@@ -29,11 +29,9 @@
    references to libraries that are not being built. */
 
 #include "config.h"
-//#include "compat/va_copy.h"
 #include "libavformat/avformat.h"
 #include "libavfilter/avfilter.h"
 #include "libavdevice/avdevice.h"
-#include "libavresample/avresample.h"
 #include "libswscale/swscale.h"
 #include "libswresample/swresample.h"
 #if CONFIG_POSTPROC
@@ -50,7 +48,6 @@
 #include "libavutil/dict.h"
 #include "libavutil/opt.h"
 #include "cmdutils.h"
-//#include "version.h"
 #if CONFIG_NETWORK
 #include "libavformat/network.h"
 #endif
