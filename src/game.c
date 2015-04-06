@@ -427,7 +427,7 @@ int main(void) {
 
     setup_uart();
 
-    is = ffplay_init("../resource/media.mp4");
+    is = ffplay_init("../resource/media.mpg");
 
     game_data.lock = SDL_CreateMutex();
     game_data.data_ready = SDL_CreateCond();
