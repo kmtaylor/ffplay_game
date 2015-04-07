@@ -1,6 +1,8 @@
 #include <termios.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <assert.h>
+#include <alsa/asoundlib.h>
 
 #include <SDL.h>
 
@@ -13,8 +15,7 @@
 #define PACKET_HEADER 0xff
 #define PACKET_SIZE 3
 
-#define UART_SPEED 115200
-#define UART_NAME "/dev/ttyS0"
+#define UART_NAME "hw:1"
 
 typedef struct s_control_packet control_packet;
 
@@ -44,7 +45,8 @@ struct s_game_data {
     enum state_enum state;
 
     uint8_t cur_instruction;
-    int fd;
+
+    snd_rawmidi_t *output, *input;
 };
 
 static struct s_game_data game_data = {
@@ -79,67 +81,53 @@ GAME_MODE(game, GAME_VIDEO_STREAM, GAME_AUDIO_STREAM)
 GAME_MODE(winner1, WINNER1_VIDEO_STREAM, WINNER1_AUDIO_STREAM)
 GAME_MODE(winner2, WINNER2_VIDEO_STREAM, WINNER2_AUDIO_STREAM)
 
-void setup_uart(void) {
-    int fd;
-    struct termios t;
-
-    fd = open(UART_NAME, O_RDWR | O_NONBLOCK | O_NOCTTY );
-    if (fd < 0) return;
-
-    /* fcntl(fd, F_SETFL, O_RDWR); turn off blocking */
-    tcgetattr(fd, &t);
-    cfsetospeed(&t, UART_SPEED);
-    cfsetispeed(&t, UART_SPEED);
-    t.c_iflag &= ~( INPCK | ISTRIP | IGNCR | ICRNL | INLCR | IXON | IXOFF |
-		    IXANY | IMAXBEL ); // Basically turn everything off
-    t.c_iflag |= IGNBRK; // Ignore break condition
-    t.c_oflag &= ~OPOST; // Transmit ouput as is
-    t.c_cflag &= ~( HUPCL | CSTOPB | PARENB | CRTSCTS );
-    t.c_cflag |= ( CLOCAL | CREAD | CS8 );
-    t.c_lflag &= ~( ICANON | ECHO | ISIG | IEXTEN | TOSTOP );
-    t.c_lflag |= NOFLSH;
-    tcsetattr(fd, TCSANOW, &t);
-    game_data.fd = fd;
+static int setup_uart(void) {
+    return snd_rawmidi_open(&game_data.input, &game_data.output, UART_NAME, 0);
 }
 
-void write_uart(uint8_t instruction, uint8_t value) {
-    int nbytes = 0, written;
+static void write_uart(uint8_t instruction, uint8_t value) {
     uint8_t data[PACKET_SIZE];
 
     data[0] = PACKET_HEADER;
     data[1] = instruction;
     data[2] = value;
 
-    while (nbytes < PACKET_SIZE) {
-	written = write(game_data.fd, &data[nbytes], 1);
-	if (written < 0) break;
-	nbytes += written;
+    if (snd_rawmidi_write(game_data.output, data, PACKET_SIZE) < 0) {
+	printf("error writing\n");
     }
 }
 
-void read_uart(void) {
-    static int byte_no;
+static void read_uart(void) {
+    int err;
     uint8_t data;
+    static int byte_no;
     control_packet *new_packet;
+    control_packet *packet_mem;
 
-    if (read(game_data.fd, &data, 1) < 1) return;
+    if ((err = snd_rawmidi_read(game_data.input, &data, 1)) < 0) {
+	return;
+    }
 
     if (data == PACKET_HEADER) byte_no = 0;
     else byte_no++;
 
     if (byte_no == 1) {
+	SDL_LockMutex(game_data.lock);
 	game_data.cur_instruction = data;
+	SDL_UnlockMutex(game_data.lock);
     } else if (byte_no == 2) {
 	/* Add to linked list */
+	packet_mem = malloc(sizeof(struct s_control_packet));
+	assert(packet_mem);
 	SDL_LockMutex(game_data.lock);
 
 	if (!game_data.packet_list) {
-	    game_data.packet_list = malloc(sizeof(struct s_control_packet));
+	    game_data.packet_list = packet_mem;
 	    new_packet = game_data.packet_list;
 	} else {
 	    new_packet = game_data.packet_list;
 	    while (new_packet->next) new_packet = new_packet->next;
-	    new_packet->next = malloc(sizeof(struct s_control_packet));
+	    new_packet->next = packet_mem;
 	    new_packet = new_packet->next;
 	}
 	new_packet->instruction = game_data.cur_instruction;
@@ -152,26 +140,16 @@ void read_uart(void) {
 }
 
 static int uart_func(void *p) {
-    fd_set readfds, loopfds;
-
-    FD_ZERO(&readfds);
-    FD_SET(game_data.fd, &readfds);
-
-    while (1) {
-	loopfds = readfds;
-	select(FD_SETSIZE, &loopfds, NULL, NULL, NULL);
-	
-	if (FD_ISSET(game_data.fd, &loopfds)) {
-	    read_uart();
-	}
-    }
+    while(1) read_uart();
 
     return 0;
 }
 
 static int data_func(void *p) {
+    int do_print;
     control_packet *packet;
     while (1) {
+	do_print = 0;
 	SDL_LockMutex(game_data.lock);
 	/* Wait until we have some packets to read */
 	while (!game_data.packet_list) {
@@ -183,17 +161,21 @@ static int data_func(void *p) {
 
 	switch (packet->instruction >> 4) {
 	    case 0x01: /* Digital input */
-		if (packet->value == 0) {
+		if (packet->value == 1 && ((packet->instruction & 0xf) == 0)) {
 		    game_data.start_game = 1;
+		    do_print = 1;
 		    SDL_CondSignal(game_data.state_changed);
 		}
 		break;
 	    case 0x02: /* Analogue input */
 		game_data.controller[packet->instruction & 1] = packet->value;
+		do_print = 2;
 		break;
 	}
 
 	SDL_UnlockMutex(game_data.lock);
+	if (do_print == 1) printf("starting\n");
+	if (do_print == 2) printf("pot %i\n", packet->value);
 
 	free(packet);
     }
@@ -323,7 +305,7 @@ static void sleep_mode(void) {
     switch (game_data.state) {
 	case ATTRACT_MODE:
 	    SDL_LockMutex(game_data.lock);
-	    while (game_data.state == ATTRACT_MODE && !timeout)
+	    while (!game_data.start_game && !timeout)
 		timeout = SDL_CondWaitTimeout(game_data.state_changed,
 				game_data.lock, 18 * 1000);
 	    SDL_UnlockMutex(game_data.lock);
@@ -332,7 +314,7 @@ static void sleep_mode(void) {
 	    sleep(8);
 	    break;
 	case GAME_MODE:
-	    sleep(10);
+	    sleep(5);
 	    break;
 	case WINNER1_MODE:
 	    sleep(5);
@@ -400,18 +382,25 @@ static int stream_func(void *is_p) {
 
 	    case GAME_MODE:
 		game_mode(is);
+		SDL_LockMutex(game_data.lock);
+		game_data.start_game = 0;
+		SDL_UnlockMutex(game_data.lock);
 		/* draw bar graphs (in a separate thread) */
 		sleep_mode();
 		break;
 
 	    case WINNER1_MODE:
 		winner1_mode(is);
+		write_uart(0x11, 0x01);
 		sleep_mode();
+		write_uart(0x11, 0x00);
 		break;
 
 	    case WINNER2_MODE:
 		winner2_mode(is);
+		write_uart(0x12, 0x01);
 		sleep_mode();
+		write_uart(0x12, 0x00);
 		break;
 	}
     }
@@ -425,9 +414,12 @@ int main(void) {
     wanted_stream[AVMEDIA_TYPE_AUDIO] = ATTRACT_AUDIO_STREAM;
     wanted_stream[AVMEDIA_TYPE_VIDEO] = ATTRACT_VIDEO_STREAM;
 
-    setup_uart();
+    if (setup_uart() < 0) {
+	printf("Unable to open uart\n");
+	return 1;
+    }
 
-    is = ffplay_init("../resource/media.mpg");
+    is = ffplay_init("/home/pi/ffplay_game/resource/media.mpg");
 
     game_data.lock = SDL_CreateMutex();
     game_data.data_ready = SDL_CreateCond();
